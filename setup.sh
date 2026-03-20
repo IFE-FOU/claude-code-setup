@@ -57,6 +57,31 @@ else
   ok "Homebrew installed"
 fi
 
+# Ensure Homebrew is in PATH for the current session and shell config
+# (Homebrew's installer may not write to the shell config in all cases)
+BREW_SHELLENV=""
+if [[ -f /opt/homebrew/bin/brew ]]; then
+  BREW_SHELLENV='eval "$(/opt/homebrew/bin/brew shellenv)"'
+elif [[ -f /usr/local/bin/brew ]]; then
+  BREW_SHELLENV='eval "$(/usr/local/bin/brew shellenv)"'
+fi
+
+if [[ -n "$BREW_SHELLENV" ]]; then
+  eval "$BREW_SHELLENV"
+  # Detect shell config to write to (same logic as Phase 5, needed early for npm)
+  case "$(basename "$SHELL")" in
+    zsh)  _EARLY_RC="$HOME/.zshrc" ;;
+    bash) _EARLY_RC="$HOME/.bash_profile" ;;
+    *)    _EARLY_RC="$HOME/.profile" ;;
+  esac
+  if ! grep -q "brew shellenv" "$_EARLY_RC" 2>/dev/null; then
+    echo "" >> "$_EARLY_RC"
+    echo "# Homebrew" >> "$_EARLY_RC"
+    echo "$BREW_SHELLENV" >> "$_EARLY_RC"
+    ok "Homebrew added to $_EARLY_RC"
+  fi
+fi
+
 # Node.js
 if command -v node &>/dev/null; then
   skip "Node.js already installed  ($(node --version))"
