@@ -7,13 +7,12 @@ set -euo pipefail
 # Safe to re-run — updates existing configuration.
 #
 # Usage:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/IFE-AS/<repo>/main/setup.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/IFE-FOU/claude-code-setup/main/setup.sh)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── IFE Configuration ─────────────────────────────────────────────────────────
 readonly SSO_START_URL="https://d-c3677f1bbd.awsapps.com/start"
 readonly SSO_REGION="eu-north-1"
-readonly SSO_ACCOUNT_ID="REDACTED_ACCOUNT"
 readonly SSO_ROLE_NAME="BedrockUserAccess"
 readonly PROFILE="ife"
 readonly AWS_REGION_VAL="eu-north-1"
@@ -42,15 +41,14 @@ echo ""
 
 # ── Phase 1: Dependencies ─────────────────────────────────────────────────────
 header "Phase 1 / 5  —  Dependencies"
+echo ""
 
 # Homebrew
-echo ""
 if command -v brew &>/dev/null; then
   skip "Homebrew already installed  ($(brew --version 2>/dev/null | head -1))"
 else
   info "Installing Homebrew (you may be prompted for your Mac password)..."
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-  # Add brew to PATH (Apple Silicon puts it in /opt/homebrew)
   if [[ -f /opt/homebrew/bin/brew ]]; then
     eval "$(/opt/homebrew/bin/brew shellenv)"
   elif [[ -f /usr/local/bin/brew ]]; then
@@ -88,15 +86,15 @@ else
   ok "Claude Code installed"
 fi
 
-# ── Phase 2: AWS Config ───────────────────────────────────────────────────────
+# ── Phase 2: AWS SSO Session Config ───────────────────────────────────────────
 header "Phase 2 / 5  —  AWS SSO Configuration"
 echo ""
 
 mkdir -p "$HOME/.aws"
 
-info "Writing AWS SSO profile to ~/.aws/config..."
+info "Writing AWS SSO session to ~/.aws/config..."
 
-# Use Python to safely update only the ife blocks, leaving other profiles intact
+# Write only the sso-session block — profile is completed after login (Phase 3)
 python3 - <<AWSCONFIG_PY
 import re, os
 
@@ -108,26 +106,19 @@ content = re.sub(r'\[sso-session ife\][^\[]*', '', content)
 content = re.sub(r'\[profile ife\][^\[]*', '', content)
 content = re.sub(r'\n{3,}', '\n\n', content).strip()
 
-new_blocks = """
+new_block = """
 
 [sso-session ife]
 sso_start_url = ${SSO_START_URL}
 sso_region = ${SSO_REGION}
 sso_registration_scopes = sso:account:access
-
-[profile ife]
-sso_session = ife
-sso_account_id = ${SSO_ACCOUNT_ID}
-sso_role_name = ${SSO_ROLE_NAME}
-region = ${AWS_REGION_VAL}
-output = json
 """
 
 with open(path, 'w') as f:
-    f.write((content + new_blocks).strip() + "\n")
+    f.write((content + new_block).strip() + "\n")
 AWSCONFIG_PY
 
-ok "AWS config written (~/.aws/config)"
+ok "SSO session written (~/.aws/config)"
 
 # ── Phase 3: SSO Login ────────────────────────────────────────────────────────
 header "Phase 3 / 5  —  SSO Login"
@@ -140,17 +131,77 @@ echo ""
 read -rp "  Press Enter to open the browser login... "
 echo ""
 
-aws sso login --profile "$PROFILE"
+aws sso login --sso-session "$PROFILE"
+
+# Discover account ID from the SSO token cache — no hardcoded account ID needed
+info "Detecting your AWS account..."
+
+ACCESS_TOKEN=$(python3 - <<'TOKEN_PY'
+import json, os, glob
+
+cache_dir = os.path.expanduser("~/.aws/sso/cache")
+files = sorted(glob.glob(os.path.join(cache_dir, "*.json")), key=os.path.getmtime, reverse=True)
+for f in files:
+    try:
+        data = json.load(open(f))
+        if "accessToken" in data:
+            print(data["accessToken"])
+            break
+    except Exception:
+        pass
+TOKEN_PY
+)
+
+if [[ -z "$ACCESS_TOKEN" ]]; then
+  fail "Could not find SSO token after login. Please re-run the script."
+fi
+
+ACCOUNT_ID=$(aws sso list-accounts \
+  --access-token "$ACCESS_TOKEN" \
+  --region "$SSO_REGION" \
+  --query "accountList[0].accountId" \
+  --output text)
+
+if [[ -z "$ACCOUNT_ID" || "$ACCOUNT_ID" == "None" ]]; then
+  fail "No AWS accounts found for your user. Please check your access with your administrator."
+fi
+
+ok "Account detected: $ACCOUNT_ID"
+
+# Write the complete profile now that we have the account ID
+python3 - <<PROFILE_PY
+import re, os
+
+path = os.path.expanduser("~/.aws/config")
+content = open(path).read() if os.path.exists(path) else ""
+
+content = re.sub(r'\[profile ife\][^\[]*', '', content)
+content = re.sub(r'\n{3,}', '\n\n', content).strip()
+
+profile_block = """
+
+[profile ife]
+sso_session = ife
+sso_account_id = ${ACCOUNT_ID}
+sso_role_name = ${SSO_ROLE_NAME}
+region = ${AWS_REGION_VAL}
+output = json
+"""
+
+with open(path, 'w') as f:
+    f.write((content + profile_block).strip() + "\n")
+PROFILE_PY
+
+ok "AWS profile written (~/.aws/config)"
 
 # ── Phase 4: Verification ─────────────────────────────────────────────────────
 header "Phase 4 / 5  —  Verifying Access"
 echo ""
 
 if IDENTITY=$(aws sts get-caller-identity --profile "$PROFILE" 2>/dev/null); then
-  ACCOUNT=$(echo "$IDENTITY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Account'])")
-  ARN=$(echo "$IDENTITY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Arn'])")
+  ARN=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
   ok "Authenticated as: $ARN"
-  ok "Account: $ACCOUNT"
+  ok "Account: $ACCOUNT_ID"
 else
   fail "Authentication failed. Please re-run the script and complete the browser login."
 fi
@@ -159,7 +210,6 @@ fi
 header "Phase 5 / 5  —  Shell Environment Variables"
 echo ""
 
-# Detect shell config file
 case "$(basename "$SHELL")" in
   zsh)  SHELL_RC="$HOME/.zshrc" ;;
   bash) SHELL_RC="$HOME/.bash_profile" ;;
@@ -170,7 +220,6 @@ info "Shell: $(basename "$SHELL")  →  $SHELL_RC"
 
 touch "$SHELL_RC"
 
-# Write the env block to a temp file (avoids heredoc quoting issues)
 TMPBLOCK=$(mktemp)
 cat > "$TMPBLOCK" <<ENVBLOCK
 # --- IFE Claude Code BEGIN ---
@@ -185,11 +234,10 @@ export CLAUDE_CODE_SUBAGENT_MODEL=${MODEL_SONNET}
 # --- IFE Claude Code END ---
 ENVBLOCK
 
-# Use Python to insert or replace the block in the shell config
 python3 - "$SHELL_RC" "$TMPBLOCK" <<'SHELLRC_PY'
 import sys, re
 
-rc_path   = sys.argv[1]
+rc_path    = sys.argv[1]
 block_path = sys.argv[2]
 
 with open(block_path) as f:
@@ -205,17 +253,17 @@ if "IFE Claude Code BEGIN" in content:
         content,
         flags=re.DOTALL
     )
-    print("updated")
 else:
     content = content.rstrip() + "\n\n" + new_block + "\n"
-    print("added")
+
+with open(rc_path, 'w') as f:
+    f.write(content)
 SHELLRC_PY
 
 rm "$TMPBLOCK"
 
 ok "Environment variables written to $SHELL_RC"
 
-# Reload the config in the current shell session
 set +u
 # shellcheck disable=SC1090
 source "$SHELL_RC" 2>/dev/null || true

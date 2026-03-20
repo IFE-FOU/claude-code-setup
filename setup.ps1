@@ -16,7 +16,6 @@ $ErrorActionPreference = "Stop"
 # ── IFE Configuration ─────────────────────────────────────────────────────────
 $SSO_START_URL  = "https://d-c3677f1bbd.awsapps.com/start"
 $SSO_REGION     = "eu-north-1"
-$SSO_ACCOUNT_ID = "REDACTED_ACCOUNT"
 $SSO_ROLE_NAME  = "BedrockUserAccess"
 $PROFILE_NAME   = "ife"
 $AWS_REGION_VAL = "eu-north-1"
@@ -54,7 +53,6 @@ if (Get-Command node -ErrorAction SilentlyContinue) {
 } else {
     Info "Installing Node.js..."
     winget install --id OpenJS.NodeJS.LTS --accept-source-agreements --accept-package-agreements --silent
-    # Refresh PATH so node is available in this session
     $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" +
                 [System.Environment]::GetEnvironmentVariable("PATH", "User")
     Ok "Node.js installed"
@@ -82,17 +80,17 @@ if (Get-Command claude -ErrorAction SilentlyContinue) {
     Ok "Claude Code installed"
 }
 
-# ── Phase 2: AWS Config ───────────────────────────────────────────────────────
+# ── Phase 2: AWS SSO Session Config ───────────────────────────────────────────
 Header "Phase 2 / 5  —  AWS SSO Configuration"
 
-$awsDir    = Join-Path $env:USERPROFILE ".aws"
+$awsDir     = Join-Path $env:USERPROFILE ".aws"
 $configPath = Join-Path $awsDir "config"
 
 if (-not (Test-Path $awsDir)) {
     New-Item -ItemType Directory -Path $awsDir | Out-Null
 }
 
-Info "Writing AWS SSO profile to $configPath..."
+Info "Writing AWS SSO session to $configPath..."
 
 $existingContent = if (Test-Path $configPath) { Get-Content $configPath -Raw } else { "" }
 
@@ -102,26 +100,20 @@ $existingContent = $existingContent -replace '(?s)\[profile ife\][^\[]*', ''
 $existingContent = $existingContent -replace '(\r?\n){3,}', "`n`n"
 $existingContent = $existingContent.Trim()
 
-$newBlocks = @"
+# Write only the sso-session block — profile is completed after login (Phase 3)
+$sessionBlock = @"
 
 
 [sso-session ife]
 sso_start_url = $SSO_START_URL
 sso_region = $SSO_REGION
 sso_registration_scopes = sso:account:access
-
-[profile ife]
-sso_session = ife
-sso_account_id = $SSO_ACCOUNT_ID
-sso_role_name = $SSO_ROLE_NAME
-region = $AWS_REGION_VAL
-output = json
 "@
 
-$finalContent = ($existingContent + $newBlocks).Trim() + "`n"
+$finalContent = ($existingContent + $sessionBlock).Trim() + "`n"
 Set-Content -Path $configPath -Value $finalContent -Encoding UTF8
 
-Ok "AWS config written ($configPath)"
+Ok "SSO session written ($configPath)"
 
 # ── Phase 3: SSO Login ────────────────────────────────────────────────────────
 Header "Phase 3 / 5  —  SSO Login"
@@ -134,7 +126,63 @@ Write-Host ""
 Read-Host "  Press Enter to open the browser login"
 Write-Host ""
 
-aws sso login --profile $PROFILE_NAME
+aws sso login --sso-session $PROFILE_NAME
+
+# Discover account ID from the SSO token cache — no hardcoded account ID needed
+Info "Detecting your AWS account..."
+
+$cacheDir = Join-Path $env:USERPROFILE ".aws\sso\cache"
+$tokenFiles = Get-ChildItem -Path $cacheDir -Filter "*.json" -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending
+
+$ACCESS_TOKEN = $null
+foreach ($file in $tokenFiles) {
+    try {
+        $data = Get-Content $file.FullName -Raw | ConvertFrom-Json
+        if ($data.accessToken) {
+            $ACCESS_TOKEN = $data.accessToken
+            break
+        }
+    } catch { }
+}
+
+if (-not $ACCESS_TOKEN) {
+    Fail "Could not find SSO token after login. Please re-run the script."
+}
+
+$accountList = aws sso list-accounts `
+    --access-token $ACCESS_TOKEN `
+    --region $SSO_REGION | ConvertFrom-Json
+
+$ACCOUNT_ID = $accountList.accountList[0].accountId
+
+if (-not $ACCOUNT_ID) {
+    Fail "No AWS accounts found for your user. Please check your access with your administrator."
+}
+
+Ok "Account detected: $ACCOUNT_ID"
+
+# Write the complete profile now that we have the account ID
+$existingContent = Get-Content $configPath -Raw
+$existingContent = $existingContent -replace '(?s)\[profile ife\][^\[]*', ''
+$existingContent = $existingContent -replace '(\r?\n){3,}', "`n`n"
+$existingContent = $existingContent.Trim()
+
+$profileBlock = @"
+
+
+[profile ife]
+sso_session = ife
+sso_account_id = $ACCOUNT_ID
+sso_role_name = $SSO_ROLE_NAME
+region = $AWS_REGION_VAL
+output = json
+"@
+
+$finalContent = ($existingContent + $profileBlock).Trim() + "`n"
+Set-Content -Path $configPath -Value $finalContent -Encoding UTF8
+
+Ok "AWS profile written ($configPath)"
 
 # ── Phase 4: Verification ─────────────────────────────────────────────────────
 Header "Phase 4 / 5  —  Verifying Access"
@@ -147,7 +195,7 @@ try {
     Fail "Authentication failed. Please re-run the script and complete the browser login."
 }
 
-# ── Phase 5: Environment Variables ───────────────────────────────────────────
+# ── Phase 5: Environment Variables ────────────────────────────────────────────
 Header "Phase 5 / 5  —  Environment Variables"
 
 $envVars = [ordered]@{
@@ -165,9 +213,7 @@ Info "Writing environment variables (User scope — persists across sessions)...
 
 foreach ($key in $envVars.Keys) {
     $value = $envVars[$key]
-    # Set for current session
     [System.Environment]::SetEnvironmentVariable($key, $value, "Process")
-    # Set permanently for the user
     [System.Environment]::SetEnvironmentVariable($key, $value, "User")
 }
 
