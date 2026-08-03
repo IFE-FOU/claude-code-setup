@@ -35,9 +35,10 @@ irm https://raw.githubusercontent.com/IFE-FOU/claude-code-setup/main/setup.ps1 |
 |-------|--------|
 | 1 | Installs required tools (see below) |
 | 2 | Writes the IFE AWS SSO profile to `~/.aws/config` |
-| 3 | Opens browser login with your IFE Microsoft credentials |
+| 3 | Opens browser login with your IFE Microsoft credentials (skipped if already logged in) |
 | 4 | Verifies AWS access |
-| 5 | Sets required environment variables (persistent) |
+
+After that, start `claude` and complete Bedrock setup once — choose **3rd-party platform → Amazon Bedrock** (or run `/setup-bedrock`), then select the `ife` profile. Claude Code auto-detects your region and which models your account can invoke.
 
 **Tools installed:**
 
@@ -52,7 +53,7 @@ irm https://raw.githubusercontent.com/IFE-FOU/claude-code-setup/main/setup.ps1 |
 
 ## Re-running
 
-The script is safe to re-run at any time — useful for updating Claude Code or refreshing model configuration. It checks what is already installed and only updates what is needed.
+The script is idempotent — safe to re-run at any time. It checks what is already installed/configured and only updates what is out of date, skipping the browser login if your AWS session is still valid.
 
 ---
 
